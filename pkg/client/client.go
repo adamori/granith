@@ -2,6 +2,7 @@ package client
 
 import (
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/adamori/granith/pkg/token"
 )
 
 var (
@@ -22,7 +25,8 @@ var (
 
 type Client struct {
 	baseURL    string
-	rawToken   []byte
+	authToken  []byte
+	tokenErr   error
 	httpClient *http.Client
 	etag       string
 }
@@ -36,9 +40,17 @@ func WithTimeout(d time.Duration) Option {
 }
 
 func New(baseURL, rawToken string, opts ...Option) *Client {
+	parsed, tokenErr := token.Parse(rawToken)
+	var authToken []byte
+	if tokenErr == nil {
+		authToken = []byte(token.Prefix + base64.RawURLEncoding.EncodeToString(parsed.LookupID))
+		parsed.Zero()
+	}
+
 	c := &Client{
-		baseURL:  baseURL,
-		rawToken: []byte(rawToken),
+		baseURL:   baseURL,
+		authToken: authToken,
+		tokenErr:  tokenErr,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &retryTransport{
@@ -71,12 +83,23 @@ type BundleResponse struct {
 	ExpiresAt  time.Time
 }
 
-func (c *Client) doFetch(requestID string) (*BundleResponse, error) {
-	req, err := http.NewRequest("GET", c.baseURL+"/api/v1/bundle", nil)
+func (c *Client) newRequest(method string) (*http.Request, error) {
+	if c.tokenErr != nil {
+		return nil, fmt.Errorf("parse token: %w", c.tokenErr)
+	}
+	req, err := http.NewRequest(method, c.baseURL+"/api/v1/bundle", nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+string(c.rawToken))
+	req.Header.Set("Authorization", "Bearer "+string(c.authToken))
+	return req, nil
+}
+
+func (c *Client) doFetch(requestID string) (*BundleResponse, error) {
+	req, err := c.newRequest(http.MethodGet)
+	if err != nil {
+		return nil, err
+	}
 	if c.etag != "" {
 		req.Header.Set("If-None-Match", c.etag)
 	}
@@ -202,18 +225,17 @@ func (c *Client) FetchBundleAwaitingApproval(status StatusFunc) (*BundleResponse
 }
 
 func (c *Client) Close() {
-	for i := range c.rawToken {
-		c.rawToken[i] = 0
+	for i := range c.authToken {
+		c.authToken[i] = 0
 	}
-	runtime.KeepAlive(c.rawToken)
+	runtime.KeepAlive(c.authToken)
 }
 
 func (c *Client) Ping() error {
-	req, err := http.NewRequest("HEAD", c.baseURL+"/api/v1/bundle", nil)
+	req, err := c.newRequest(http.MethodHead)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+string(c.rawToken))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
